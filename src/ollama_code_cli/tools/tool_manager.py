@@ -1,502 +1,484 @@
-"""
-Tool implementations for the Ollama Code CLI.
-"""
+
 
 import json
 import os
-import subprocess
 import sys
+import subprocess
 import tempfile
-from typing import Dict, Any
+import shutil
+import fnmatch
+import time
+from typing import Dict, Any, List, Optional
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.panel import Panel
 
 
+# ============================================================
+# Tool Manager
+# ============================================================
+
 class ToolManager:
-    """Manager for all available tools."""
+    """Main tool manager for the Ollama Code CLI — all tools live here."""
 
-    def __init__(self, require_permission: bool = True):
-        self.tools = self._initialize_tools()
-        self.require_permission = require_permission
+    # ---------------------------------------------------------
+    # Constructor
+    # ---------------------------------------------------------
+
+    def __init__(
+        self,
+        require_permission: bool = True,
+        rate_limit_ms: int = 150,   # small safety delay between dangerous ops
+    ):
         self.console = Console()
+        self.require_permission = require_permission
+        self.rate_limit_ms = rate_limit_ms
+        self.tools = self._define_tools()
+        self.last_tool_call_time = 0
 
-    def _initialize_tools(self) -> Dict[str, Dict[str, Any]]:
-        """Initialize available tools for the LLM."""
+
+    # ---------------------------------------------------------
+    # Tool Definitions
+    # ---------------------------------------------------------
+
+    def _define_tools(self) -> Dict[str, Dict[str, Any]]:
+        """Define all tools and their schemas."""
         return {
+
+            # -------------------------------------------------
+            # BASIC FILE OPERATIONS
+            # -------------------------------------------------
+
             "read_file": {
                 "function": self._read_file,
-                "description": "Read the contents of a file",
+                "description": "Read the contents of a file.",
                 "requires_permission": False,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the file to read",
+                        "filepath": {"type": "string"},
+                        "max_bytes": {
+                            "type": "integer",
+                            "description": "Optional limit to prevent huge reads."
                         }
                     },
                     "required": ["filepath"],
                 },
             },
+
             "write_file": {
                 "function": self._write_file,
-                "description": "Write content to a file",
+                "description": "Write text content to a file.",
                 "requires_permission": True,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the file to write",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Content to write to the file",
+                        "filepath": {"type": "string"},
+                        "content": {"type": "string"},
+                        "append": {
+                            "type": "boolean",
+                            "description": "If true, append instead of overwrite."
                         },
                     },
                     "required": ["filepath", "content"],
                 },
             },
-            "execute_code": {
-                "function": self._execute_code,
-                "description": "Execute code in a subprocess",
-                "requires_permission": True,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "Code to execute"},
-                        "language": {
-                            "type": "string",
-                            "description": "Programming language (python, javascript, etc.)",
-                            "default": "python",
-                        },
-                    },
-                    "required": ["code"],
-                },
-            },
+
             "list_files": {
                 "function": self._list_files,
-                "description": "List files in a directory",
+                "description": "List files in a directory.",
                 "requires_permission": False,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {
+                        "path": {"type": "string", "default": "."},
+                        "pattern": {
                             "type": "string",
-                            "description": "Directory path to list files in",
-                            "default": ".",
+                            "description": "Optional glob filter (e.g. *.py)"
                         }
-                    },
+                    }
                 },
             },
-            "run_command": {
-                "function": self._run_command,
-                "description": "Run a shell command",
+
+            "file_info": {
+                "function": self._file_info,
+                "description": "Get metadata about a file.",
+                "requires_permission": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {"type": "string"}
+                    },
+                    "required": ["filepath"],
+                }
+            },
+
+            "delete_file": {
+                "function": self._delete_file,
+                "description": "Delete a file safely.",
                 "requires_permission": True,
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to execute",
-                        }
-                    },
-                    "required": ["command"],
-                },
-            },
-            "run_python_file": {
-                "function": self._run_python_file,
-                "description": "Run an existing Python file",
-                "requires_permission": True,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "filepath": {
-                            "type": "string",
-                            "description": "Path to the Python file to execute",
-                        }
+                        "filepath": {"type": "string"}
                     },
                     "required": ["filepath"],
                 },
             },
+
+            "make_directory": {
+                "function": self._make_directory,
+                "description": "Create a directory (including nested).",
+                "requires_permission": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"}
+                    },
+                    "required": ["path"],
+                },
+            },
+
+
+            # -------------------------------------------------
+            # CODE EXECUTION
+            # -------------------------------------------------
+
+            "execute_code": {
+                "function": self._execute_code,
+                "description": "Execute code in a sandboxed subprocess.",
+                "requires_permission": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"},
+                        "language": {"type": "string", "default": "python"},
+                        "stdin": {"type": "string"},
+                        "timeout": {"type": "integer", "default": 30}
+                    },
+                    "required": ["code"],
+                }
+            },
+
+            "run_python_file": {
+                "function": self._run_python_file,
+                "description": "Execute an existing Python file.",
+                "requires_permission": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filepath": {"type": "string"},
+                        "timeout": {"type": "integer", "default": 30}
+                    },
+                    "required": ["filepath"],
+                }
+            },
+
+
+            # -------------------------------------------------
+            # COMMAND EXECUTION
+            # -------------------------------------------------
+
+            "run_command": {
+                "function": self._run_command,
+                "description": "Execute a shell command.",
+                "requires_permission": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer", "default": 30}
+                    },
+                    "required": ["command"],
+                }
+            },
         }
 
-    def _ask_permission(self, tool_name: str, details: str) -> bool:
-        """Ask user for permission to execute a potentially dangerous operation."""
+
+    # ---------------------------------------------------------
+    # Permission + Safety Layer
+    # ---------------------------------------------------------
+
+    def _safety_wait(self):
+        """Apply a rate-limit delay to avoid rapid chained tool calls."""
+        now = time.time()
+        diff = (now - self.last_tool_call_time) * 1000
+        if diff < self.rate_limit_ms:
+            time.sleep((self.rate_limit_ms - diff) / 1000)
+        self.last_tool_call_time = time.time()
+
+    def _ask_permission(self, tool: str, description: str) -> bool:
         if not self.require_permission:
             return True
-
-        warning_panel = Panel(
-            f"[bold yellow]⚠️  Permission Required[/bold yellow]\n\n"
-            f"[bold]Tool:[/bold] {tool_name}\n"
-            f"[bold]Action:[/bold] {details}\n\n"
-            f"[dim]This operation may modify your system or files.[/dim]",
-            title="🔒 Security Check",
+        panel = Panel(
+            f"[bold yellow]⚠️ Tool Requires Permission[/bold yellow]\n\n"
+            f"[bold]Tool:[/bold] {tool}\n"
+            f"[bold]Reason:[/bold] {description}",
+            title="Security Check",
             border_style="yellow",
         )
-        self.console.print(warning_panel)
+        self.console.print(panel)
+        return Confirm.ask("[bold blue]Proceed?[/bold blue]", default=False)
 
-        return Confirm.ask(
-            "[bold blue]Do you want to proceed?[/bold blue]", default=False
-        )
+    def _safe_path(self, path: str) -> str:
+        """Normalize + prevent nonsense paths."""
+        return os.path.abspath(os.path.expanduser(path))
 
-    def _read_file(self, filepath: str) -> Dict[str, Any]:
-        """Read a file and return its contents."""
-        if not filepath or not isinstance(filepath, str):
-            return {
-                "status": "error",
-                "message": "Invalid filepath provided",
-            }
 
+    # ---------------------------------------------------------
+    # File Tools
+    # ---------------------------------------------------------
+
+    def _read_file(self, filepath: str, max_bytes: Optional[int] = None) -> Dict[str, Any]:
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-            return {
-                "status": "success",
-                "content": content,
-                "message": f"Successfully read {filepath}",
-            }
+            path = self._safe_path(filepath)
+            with open(path, "rb") as f:
+                data = f.read(max_bytes) if max_bytes else f.read()
+            return {"status": "success", "content": data.decode("utf-8", errors="replace")}
         except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to read {filepath}: {str(e)}",
-            }
+            return {"status": "error", "message": str(e)}
 
-    def _write_file(self, filepath: str, content: str) -> Dict[str, Any]:
-        """Write content to a file."""
-        if not filepath or not isinstance(filepath, str):
-            return {
-                "status": "error",
-                "message": "Invalid filepath provided",
-            }
+    def _write_file(self, filepath: str, content: str, append: bool = False) -> Dict[str, Any]:
+        path = self._safe_path(filepath)
 
-        if content is None or not isinstance(content, str):
-            return {
-                "status": "error",
-                "message": "Invalid content provided",
-            }
-
-        # Ask for permission before writing file
-        file_exists = os.path.exists(filepath)
-        action_desc = f"{'Overwrite' if file_exists else 'Create'} file: {filepath}"
-        if not self._ask_permission("write_file", action_desc):
-            return {
-                "status": "cancelled",
-                "message": "File write operation cancelled by user",
-            }
+        action = "Append to" if append else "Write to"
+        if not self._ask_permission("write_file", f"{action} file: {path}"):
+            return {"status": "cancelled"}
 
         try:
-            directory = os.path.dirname(filepath) or "."
-            if directory != ".":
-                os.makedirs(directory, exist_ok=True)
-            with open(filepath, "w", encoding="utf-8") as f:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            mode = "a" if append else "w"
+            with open(path, mode, encoding="utf-8") as f:
                 f.write(content)
-            return {"status": "success", "message": f"Successfully wrote to {filepath}"}
+            return {"status": "success", "message": f"{action} succeeded"}
         except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to write to {filepath}: {str(e)}",
-            }
+            return {"status": "error", "message": str(e)}
 
-    def _execute_code(self, code: str, language: str = "python") -> Dict[str, Any]:
-        """Execute code in a subprocess."""
-        if not code or not isinstance(code, str):
-            return {
-                "status": "error",
-                "message": "Invalid code provided",
-            }
-
-        if not language or not isinstance(language, str):
-            return {
-                "status": "error",
-                "message": "Invalid language provided",
-            }
-
-        if not code.strip():
-            return {
-                "status": "error",
-                "message": "No code provided to execute",
-            }
-
-        # Ask for permission before executing code
-        code_preview = code[:100] + "..." if len(code) > 100 else code
-        action_desc = f"Execute {language} code:\n{code_preview}"
-        if not self._ask_permission("execute_code", action_desc):
-            return {
-                "status": "cancelled",
-                "message": "Code execution cancelled by user",
-            }
-
-        temp_file = None
+    def _list_files(self, path: str = ".", pattern: str = None) -> Dict[str, Any]:
         try:
-            if language == "python":
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".py", delete=False
-                ) as f:
-                    f.write(code)
-                    temp_file = f.name
-
-                # Get current working directory and environment
-                current_dir = os.getcwd()
-                env = os.environ.copy()
-
-                result = subprocess.run(
-                    [sys.executable, temp_file],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    cwd=current_dir,
-                    env=env,
-                )
-
-                return {
-                    "status": "success" if result.returncode == 0 else "error",
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode,
-                    "message": "Code executed successfully"
-                    if result.returncode == 0
-                    else f"Code execution failed with return code {result.returncode}",
-                }
-            else:
-                return {
-                    "status": "error",
-                    "message": f"Language '{language}' not supported for execution",
-                }
-        except subprocess.TimeoutExpired:
-            return {
-                "status": "error",
-                "message": "Code execution timed out (30s limit)",
-            }
+            root = self._safe_path(path)
+            files = os.listdir(root)
+            if pattern:
+                files = [f for f in files if fnmatch.fnmatch(f, pattern)]
+            return {"status": "success", "files": files}
         except Exception as e:
-            return {"status": "error", "message": f"Failed to execute code: {str(e)}"}
-        finally:
-            # Clean up temporary file
-            if temp_file and os.path.exists(temp_file):
-                try:
-                    os.unlink(temp_file)
-                except Exception:
-                    pass  # Ignore cleanup errors
+            return {"status": "error", "message": str(e)}
 
-    def _list_files(self, path: str = ".") -> Dict[str, Any]:
-        """List files in a directory."""
-        if not path or not isinstance(path, str):
-            return {
-                "status": "error",
-                "message": "Invalid path provided",
-            }
-
+    def _file_info(self, filepath: str) -> Dict[str, Any]:
         try:
-            files = os.listdir(path)
+            path = self._safe_path(filepath)
+            stat = os.stat(path)
             return {
                 "status": "success",
-                "files": files,
-                "message": f"Listed files in {path}",
+                "info": {
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "created": stat.st_ctime,
+                    "is_file": os.path.isfile(path),
+                    "is_dir": os.path.isdir(path),
+                },
             }
         except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to list files in {path}: {str(e)}",
-            }
+            return {"status": "error", "message": str(e)}
 
-    def _run_command(self, command: str) -> Dict[str, Any]:
-        """Run a shell command."""
-        if not command or not isinstance(command, str):
-            return {
-                "status": "error",
-                "message": "Invalid command provided",
-            }
-
-        if not command.strip():
-            return {
-                "status": "error",
-                "message": "No command provided to execute",
-            }
-
-        # Ask for permission before running shell command
-        action_desc = f"Execute shell command: {command}"
-        if not self._ask_permission("run_command", action_desc):
-            return {
-                "status": "cancelled",
-                "message": "Shell command execution cancelled by user",
-            }
+    def _delete_file(self, filepath: str) -> Dict[str, Any]:
+        path = self._safe_path(filepath)
+        if not self._ask_permission("delete_file", f"Remove file: {path}"):
+            return {"status": "cancelled"}
 
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, timeout=30
+            os.remove(path)
+            return {"status": "success", "message": "File deleted"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def _make_directory(self, path: str) -> Dict[str, Any]:
+        real = self._safe_path(path)
+        if not self._ask_permission("make_directory", f"Create directory: {real}"):
+            return {"status": "cancelled"}
+        try:
+            os.makedirs(real, exist_ok=True)
+            return {"status": "success", "message": "Directory created"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+
+    # ---------------------------------------------------------
+    # Code Execution
+    # ---------------------------------------------------------
+
+    def _execute_code(
+        self,
+        code: str,
+        language: str = "python",
+        stdin: Optional[str] = None,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+
+        code_preview = code[:120].replace("\n", " ") + ("..." if len(code) > 120 else "")
+        if not self._ask_permission("execute_code", f"Run {language} code:\n{code_preview}"):
+            return {"status": "cancelled"}
+
+        if language != "python":
+            return {"status": "error", "message": f"Unsupported language: {language}"}
+
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+                f.write(code)
+                temp_path = f.name
+
+            proc = subprocess.run(
+                [sys.executable, temp_path],
+                input=stdin,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
             )
+
             return {
-                "status": "success",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
             }
+
         except subprocess.TimeoutExpired:
-            return {"status": "error", "message": "Command execution timed out"}
+            return {"status": "error", "message": f"Execution exceeded {timeout}s"}
+
         except Exception as e:
-            return {"status": "error", "message": f"Failed to run command: {str(e)}"}
+            return {"status": "error", "message": str(e)}
 
-    def _run_python_file(self, filepath: str) -> Dict[str, Any]:
-        """Run an existing Python file."""
-        if not filepath or not isinstance(filepath, str):
-            return {
-                "status": "error",
-                "message": "Invalid filepath provided",
-            }
+        finally:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
-        if not os.path.exists(filepath):
-            return {
-                "status": "error",
-                "message": f"File not found: {filepath}",
-            }
 
-        if not filepath.endswith(".py"):
-            return {
-                "status": "error",
-                "message": f"File is not a Python file: {filepath}",
-            }
+    def _run_python_file(self, filepath: str, timeout: int = 30) -> Dict[str, Any]:
+        path = self._safe_path(filepath)
 
-        # Ask for permission before running Python file
-        action_desc = f"Execute Python file: {filepath}"
-        if not self._ask_permission("run_python_file", action_desc):
-            return {
-                "status": "cancelled",
-                "message": "Python file execution cancelled by user",
-            }
+        if not self._ask_permission("run_python_file", f"Execute: {path}"):
+            return {"status": "cancelled"}
+
+        if not os.path.exists(path):
+            return {"status": "error", "message": "File not found"}
 
         try:
-            current_dir = os.getcwd()
-            env = os.environ.copy()
-
-            result = subprocess.run(
-                [sys.executable, filepath],
+            proc = subprocess.run(
+                [sys.executable, path],
                 capture_output=True,
                 text=True,
-                timeout=30,
-                cwd=current_dir,
-                env=env,
+                timeout=timeout,
             )
-
             return {
-                "status": "success" if result.returncode == 0 else "error",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode,
-                "message": f"Python file executed successfully: {filepath}"
-                if result.returncode == 0
-                else f"Python file execution failed with return code {result.returncode}: {filepath}",
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
+            }
+
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "message": "Timeout"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+
+    # ---------------------------------------------------------
+    # Shell Commands
+    # ---------------------------------------------------------
+
+    def _run_command(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+        if not self._ask_permission("run_command", f"Shell command:\n{command}"):
+            return {"status": "cancelled"}
+
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": proc.stdout,
+                "stderr": proc.stderr,
+                "returncode": proc.returncode,
             }
         except subprocess.TimeoutExpired:
-            return {
-                "status": "error",
-                "message": f"Python file execution timed out (30s limit): {filepath}",
-            }
+            return {"status": "error", "message": "Timeout"}
         except Exception as e:
-            return {
-                "status": "error",
-                "message": f"Failed to run Python file {filepath}: {str(e)}",
-            }
+            return {"status": "error", "message": str(e)}
 
-    def get_tools_for_ollama(self) -> list:
-        """Format tools for Ollama API."""
-        tools = []
-        for name, tool in self.tools.items():
-            tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": tool["description"],
-                        "parameters": tool["parameters"],
-                    },
+
+    # ---------------------------------------------------------
+    # Ollama API Interface
+    # ---------------------------------------------------------
+
+    def get_tools_for_ollama(self) -> List[dict]:
+        """Return tool definitions in Ollama-function format."""
+        out = []
+        for name, t in self.tools.items():
+            out.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": t["description"],
+                    "parameters": t["parameters"],
                 }
-            )
-        return tools
+            })
+        return out
 
-    def handle_tool_calls(self, tool_calls: list) -> list:
-        """Handle tool calls from the LLM."""
+
+    def handle_tool_calls(self, tool_calls: List[dict]) -> List[dict]:
+        """Execute LLM tool calls sequentially with safety + validation."""
         results = []
-        for tool_call in tool_calls:
-            name = tool_call.get("function", {}).get("name")
-            arguments = tool_call.get("function", {}).get("arguments", {})
+        for call in tool_calls:
 
-            # Handle case where arguments come as JSON string from LLM
-            if isinstance(arguments, str):
+            name = call.get("function", {}).get("name")
+            args = call.get("function", {}).get("arguments", {})
+
+            self._safety_wait()
+
+            # Parse arguments JSON or dict
+            if isinstance(args, str):
                 try:
-                    arguments = json.loads(arguments)
-                except json.JSONDecodeError as e:
-                    results.append(
-                        {
-                            "role": "tool",
-                            "content": json.dumps(
-                                {
-                                    "status": "error",
-                                    "message": f"Invalid JSON arguments: {str(e)}",
-                                }
-                            ),
-                            "name": name or "unknown",
-                        }
-                    )
+                    args = json.loads(args)
+                except Exception:
+                    results.append({
+                        "role": "tool",
+                        "name": name,
+                        "content": json.dumps({"status": "error", "message": "Invalid JSON arguments"}),
+                    })
                     continue
 
-            # Ensure arguments is a dictionary
-            if not isinstance(arguments, dict):
-                results.append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps(
-                            {
-                                "status": "error",
-                                "message": f"Arguments must be a dictionary, got {type(arguments)}",
-                            }
-                        ),
-                        "name": name or "unknown",
-                    }
-                )
+            if name not in self.tools:
+                results.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps({"status": "error", "message": f"Unknown tool: {name}"})
+                })
                 continue
 
-            if name in self.tools:
-                try:
-                    result = self.tools[name]["function"](**arguments)
-                    results.append(
-                        {"role": "tool", "content": json.dumps(result), "name": name}
-                    )
-                except TypeError as e:
-                    # Handle case where argument names don't match function parameters
-                    results.append(
-                        {
-                            "role": "tool",
-                            "content": json.dumps(
-                                {
-                                    "status": "error",
-                                    "message": f"Invalid arguments for {name}: {str(e)}",
-                                }
-                            ),
-                            "name": name,
-                        }
-                    )
-                except Exception as e:
-                    results.append(
-                        {
-                            "role": "tool",
-                            "content": json.dumps(
-                                {
-                                    "status": "error",
-                                    "message": f"Tool execution failed: {str(e)}",
-                                }
-                            ),
-                            "name": name,
-                        }
-                    )
-            else:
-                results.append(
-                    {
-                        "role": "tool",
-                        "content": json.dumps(
-                            {"status": "error", "message": f"Unknown tool: {name}"}
-                        ),
-                        "name": name or "unknown",
-                    }
-                )
+            try:
+                out = self.tools[name]["function"](**args)
+                results.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps(out),
+                })
+            except TypeError as e:
+                results.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps({"status": "error", "message": f"Bad arguments: {str(e)}"}),
+                })
+            except Exception as e:
+                results.append({
+                    "role": "tool",
+                    "name": name,
+                    "content": json.dumps({"status": "error", "message": str(e)}),
+                })
+
         return results
